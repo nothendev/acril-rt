@@ -2,6 +2,9 @@
 name = "acril-rt"
 version = "0.1.0"
 edition = "2021"
+description = "A lightweight single-threaded runtime for Acril actors."
+license = "MIT"
+repository = "https://github.com/nothendev/acril-rt"
 
 [dependencies]
 acril = { git = "https://github.com/PassivityTrading/acril", version = "0.1.0", default-features = false }
