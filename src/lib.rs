@@ -86,6 +86,53 @@ impl<S: Service> Clone for Addr<S> {
     }
 }
 
+pub struct Recipient<M, Response, Error> {
+    addr: AddrErased,
+    runner_fn: fn(Option<Sender<Result<Response, Error>>>) -> ProcessRunner,
+    phantom: PhantomData<(M, Response, Error)>,
+}
+
+impl<M, Response, Error> Recipient<M, Response, Error> {
+    /// Send a message to the service pointed to by this address.
+    pub async fn send(&self, msg: M) -> Result<Response, Error>
+    where
+        M: 'static + Send + Sync,
+        Error: Send + Sync,
+        Response: Send + Sync,
+    {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        self.addr
+            .runner_tx
+            .send((
+                self.addr.id,
+                (self.runner_fn)(Some(tx)),
+                Msg::Ok(Box::new(msg)),
+            ))
+            .unwrap();
+
+        rx.recv().await.unwrap()
+    }
+
+    /// Just send a message, without waiting for a response.
+    ///
+    /// Be aware that by using this function you allow desynchonization to happen, as this function
+    /// doesn't wait for the response.
+    ///
+    /// If you don't want desyncs to happen, use [`send`](Self::send).
+    pub fn do_send(&self, msg: M)
+    where
+        M: 'static + Send + Sync,
+        Error: Send + Sync,
+        Response: Send + Sync,
+    {
+        self.addr
+            .runner_tx
+            .send((self.addr.id, (self.runner_fn)(None), Msg::Ok(Box::new(msg))))
+            .unwrap()
+    }
+}
+
 /// An erased service address, containing an ID and message sender.
 #[derive(Clone)]
 struct AddrErased {
@@ -152,6 +199,20 @@ impl<S: Service<Context = Context<S>>> Addr<S> {
                 Msg::Err(err.map(|x| Box::new(x) as Unknown)),
             ))
             .unwrap()
+    }
+
+    pub fn recipient<M>(&self) -> Recipient<M, S::Response, S::Error>
+    where
+        S: Handler<M> + Send + Sync + 'static,
+        S::Error: Send + Sync + 'static,
+        S::Response: Send + Sync + 'static,
+        M: Send + Sync + 'static,
+    {
+        Recipient {
+            addr: self.erased.clone(),
+            runner_fn: message_handler::<S, M>,
+            phantom: PhantomData,
+        }
     }
 }
 

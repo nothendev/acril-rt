@@ -73,6 +73,7 @@ impl acril::Service for Pinger {
         Ok(())
     }
 }
+
 impl acril::Handler<Ping> for Pinger {
     type Response = Pong;
 
