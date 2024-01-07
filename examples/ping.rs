@@ -15,6 +15,14 @@ enum Printer {
 impl acril::Service for Printer {
     type Context = acril_rt::Context<Self>;
     type Error = ();
+    async fn started(&mut self, _cx: &mut Self::Context) -> Result<(), Self::Error> {
+        match self {
+            Self::ToStdout => println!("printing to stdout"),
+            Self::ToString(_) => println!("printing to a string"),
+        };
+
+        Ok(())
+    }
 }
 
 struct GetOutput;
@@ -59,6 +67,11 @@ struct Pong(u32);
 impl acril::Service for Pinger {
     type Context = acril_rt::Context<Self>;
     type Error = ();
+
+    async fn started(&mut self, _cx: &mut Self::Context) -> Result<(), Self::Error> {
+        println!("Launching pinger!");
+        Ok(())
+    }
 }
 impl acril::Handler<Ping> for Pinger {
     type Response = Pong;
@@ -93,29 +106,33 @@ async fn main() {
 
     let runtime = acril_rt::Runtime::new();
 
-    local_set.run_until(async move {
-        #[cfg(debug_assertions)]
-        let printer = runtime.spawn(Printer::ToStdout).await;
-        #[cfg(not(debug_assertions))]
-        let printer = runtime.spawn(Printer::ToString(String::new())).await;
-        let pinger = runtime.spawn(Pinger { count: 0 }).await;
+    const PINGS: u32 = 1000;
 
-        printer.send("Liftoff!".to_string()).await.unwrap();
+    local_set
+        .run_until(async move {
+            #[cfg(debug_assertions)]
+            let printer = runtime.spawn(Printer::ToStdout).await.unwrap();
+            #[cfg(not(debug_assertions))]
+            let printer = runtime.spawn(Printer::ToString(String::new())).await.unwrap();
+            let pinger = runtime.spawn(Pinger { count: 0 }).await.unwrap();
 
-        for i in 0..10000 {
-            let pong = pinger.send(Ping).await.unwrap();
+            printer.send("All services launched! LIFTOFF!".to_string()).await.unwrap();
 
-            // i is 0-based and pong is 1-based because the pinger increments before returning
-            assert_eq!(pong.0, i + 1);
+            for i in 0..PINGS {
+                let pong = pinger.send(Ping).await.unwrap();
 
-            printer.send(format!("pong #{}", pong.0)).await.unwrap();
-        }
+                // i is 0-based and pong is 1-based because the pinger increments before returning
+                assert_eq!(pong.0, i + 1);
 
-        assert_eq!(pinger.send(GetOutput).await.unwrap(), 10000);
-        #[cfg(not(debug_assertions))]
-        // assert that the output is Ok(Some(non_empty_string))
-        assert!(!printer.send(GetOutput).await.unwrap().unwrap().is_empty());
+                printer.send(format!("pong #{}", pong.0)).await.unwrap();
+            }
 
-        printer.send("We're done!".to_string()).await.unwrap();
-    }).await;
+            assert_eq!(pinger.send(GetOutput).await.unwrap(), PINGS);
+            #[cfg(not(debug_assertions))]
+            // assert that the output is Ok(Some(non_empty_string))
+            assert!(!printer.send(GetOutput).await.unwrap().unwrap().is_empty());
+
+            printer.send("We're done!".to_string()).await.unwrap();
+        })
+        .await;
 }

@@ -34,15 +34,42 @@ type ProcessRunner = Arc<
     dyn Fn(
             AnyProc,
             AddrErased,
-            AnyMsg,
+            Msg,
             UnboundedSender<RuntimeCommand>,
-        ) -> Pin<Box<dyn Future<Output = AnyProc>>>
+        ) -> Pin<Box<dyn Future<Output = Result<AnyProc, Option<AnyErr>>>>>
+        + Send
+        + Sync,
+>;
+
+type ProcessStarter = Arc<
+    dyn Fn(
+            AnyProc,
+            AddrErased,
+            UnboundedSender<RuntimeCommand>,
+        ) -> Pin<Box<dyn Future<Output = Result<AnyProc, Option<AnyErr>>>>>
+        + Send
+        + Sync,
+>;
+
+type ProcessEnder = Arc<
+    dyn Fn(
+            AnyProc,
+            AddrErased,
+            Option<AnyErr>,
+            UnboundedSender<RuntimeCommand>,
+        ) -> Pin<Box<dyn Future<Output = Result<AnyProc, Option<AnyErr>>>>>
         + Send
         + Sync,
 >;
 
 /// The sender half of a channel for sending messages to running services.
-type MessageSender = UnboundedSender<(u32, ProcessRunner, AnyMsg)>;
+type MessageSender = UnboundedSender<(u32, ProcessRunner, Msg)>;
+
+/// A type-erased error
+type AnyErr = Unknown;
+
+/// A message - either a normal one or a stop request.
+type Msg = Result<AnyMsg, Option<AnyErr>>;
 
 /// A handle to a running [`Service`], allowing to send messages to it.
 pub struct Addr<S: Service> {
@@ -82,7 +109,7 @@ impl<S: Service<Context = Context<S>>> Addr<S> {
             .send((
                 self.erased.id,
                 message_handler::<S, M>(Some(tx)),
-                Box::new(msg),
+                Msg::Ok(Box::new(msg)),
             ))
             .unwrap();
 
@@ -104,9 +131,51 @@ impl<S: Service<Context = Context<S>>> Addr<S> {
     {
         self.erased
             .runner_tx
-            .send((self.erased.id, message_handler::<S, M>(None), Box::new(msg)))
+            .send((
+                self.erased.id,
+                message_handler::<S, M>(None),
+                Msg::Ok(Box::new(msg)),
+            ))
             .unwrap()
     }
+
+    pub fn stop(&self, err: Option<S::Error>)
+    where
+        S: Send + Sync + 'static,
+        S::Error: Send + Sync + 'static,
+    {
+        self.erased
+            .runner_tx
+            .send((
+                self.erased.id,
+                stop_handler::<S>(),
+                Msg::Err(err.map(|x| Box::new(x) as Unknown)),
+            ))
+            .unwrap()
+    }
+}
+
+fn stop_handler<S: Service<Context = Context<S>> + Send + Sync + 'static>() -> ProcessRunner
+where
+    S::Error: Send + Sync + 'static,
+{
+    Arc::new(|proc, addr, msg, commands| {
+        Box::pin(async move {
+            let mut proc = proc.downcast::<S>().unwrap();
+
+            proc.stopping(&mut Context {
+                addr: Addr {
+                    erased: addr,
+                    phantom: PhantomData,
+                },
+                commands,
+            })
+            .await
+            .map_err(|x| Some(Box::new(x) as AnyErr))?;
+
+            msg
+        })
+    })
 }
 
 /// A service context.
@@ -179,10 +248,10 @@ where
 {
     Arc::new(move |actor, erased, msg, commands| {
         let mut proc = actor.downcast::<S>().unwrap();
-        let msg = msg.downcast::<M>().unwrap();
         let responder = responder.clone();
-
         Box::pin(async move {
+            let msg = msg?.downcast::<M>().unwrap();
+
             let res = proc
                 .call(
                     *msg,
@@ -200,7 +269,7 @@ where
                 responder.send(res).await.ok();
             }
 
-            proc as Unknown
+            Ok(proc as Unknown)
         })
     })
 }
@@ -331,7 +400,9 @@ enum RuntimeCommand {
     Process {
         ty: TypeId,
         proc: AnyProc,
-        addr: oneshot::Sender<AddrErased>,
+        addr: oneshot::Sender<Result<AddrErased, AnyErr>>,
+        end_handler: ProcessEnder,
+        start_handler: ProcessStarter,
     },
     /// Get the address of a singleton service with said [`TypeId`].
     GetAddrOf {
@@ -366,54 +437,137 @@ impl Runtime {
     pub async fn spawn<S: Service<Context = Context<S>> + Send + Sync + 'static>(
         &self,
         service: S,
-    ) -> Addr<S> {
+    ) -> Result<Addr<S>, S::Error>
+    where
+        S::Error: Send + Sync + 'static,
+    {
         let (addr_send, addr_recv) = oneshot::channel();
+
+        fn start_handler<S: Service<Context = Context<S>> + Send + Sync + 'static>(
+        ) -> ProcessStarter
+        where
+            S::Error: Send + Sync + 'static,
+        {
+            Arc::new(|proc, addr, commands| {
+                Box::pin(async move {
+                    let mut proc = proc.downcast::<S>().unwrap();
+
+                    proc.started(&mut Context {
+                        commands,
+                        addr: Addr {
+                            erased: addr,
+                            phantom: PhantomData,
+                        },
+                    })
+                    .await
+                    .map_err(|e| Some(Box::new(e) as AnyErr))?;
+
+                    Ok(proc as AnyProc)
+                })
+            })
+        }
+
+        fn end_handler<S: Service<Context = Context<S>> + Send + Sync + 'static>() -> ProcessEnder
+        where
+            S::Error: Send + Sync + 'static,
+        {
+            Arc::new(|proc, addr, _error, commands| {
+                Box::pin(async move {
+                    let mut proc = proc.downcast::<S>().unwrap();
+
+                    proc.stopping(&mut Context {
+                        commands,
+                        addr: Addr {
+                            erased: addr,
+                            phantom: PhantomData,
+                        },
+                    })
+                    .await
+                    .map_err(|e| Some(Box::new(e) as AnyErr))?;
+
+                    Ok(proc as AnyProc)
+                })
+            })
+        }
 
         self.command_sender
             .send(RuntimeCommand::Process {
                 ty: service.type_id(),
                 proc: Box::new(service),
+                start_handler: start_handler::<S>(),
+                end_handler: end_handler::<S>(),
                 addr: addr_send,
             })
             .unwrap();
 
-        Addr {
-            erased: addr_recv.await.unwrap(),
+        Ok(Addr {
+            erased: addr_recv
+                .await
+                .unwrap()
+                .map_err(|e| *e.downcast::<S::Error>().unwrap())?,
             phantom: PhantomData,
-        }
+        })
     }
 
     async fn event_loop(
         mut commands: UnboundedReceiver<RuntimeCommand>,
         commands_sender: UnboundedSender<RuntimeCommand>,
     ) {
-        let processes: Arc<RwLock<HashMap<u32, (TypeId, AnyProc)>>> =
+        let processes: Arc<RwLock<HashMap<u32, (TypeId, AnyProc, ProcessEnder)>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let mut count: u32 = 0;
         let (message_sender, mut messages): (MessageSender, _) = unbounded_channel();
+        let mut tasks = vec![];
 
         loop {
             tokio::select! {
                 Some((id, runner, msg)) = messages.recv() => {
-                            let (ty, proc) = processes.write().await.remove(&id).unwrap();
+                    let Some((ty, proc, _ender)) = processes.write().await.remove(&id) else { continue };
 
-                            tokio::task::spawn_local({ let processes = processes.clone(); let commands_sender = commands_sender.clone(); let runner_tx = message_sender.clone(); async move {
-                                let proc = runner(proc, AddrErased { id, runner_tx }, msg, commands_sender).await;
-                                processes.write().await.insert(id, (ty, proc));
-                            }});
+                    tasks.push(tokio::task::spawn_local({
+                        let processes = processes.clone();
+                        let commands_sender = commands_sender.clone();
+                        let runner_tx = message_sender.clone();
+                        async move {
+                            match runner(proc, AddrErased { id, runner_tx }, msg, commands_sender).await {
+                                Ok(proc) => {
+                                    processes.write().await.insert(id, (ty, proc, _ender));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }));
                 }
                 Some(command) = commands.recv() => {
                     match command {
-                        RuntimeCommand::Process { ty, proc, addr } => {
+                        RuntimeCommand::Process { ty, proc, start_handler, addr, end_handler } => {
                             let id = count;
-                            processes.write().await.insert(id, (ty, proc));
                             count += 1;
-                            let _ = addr.send(AddrErased { id, runner_tx: message_sender.clone() });
+                            tasks.push(tokio::task::spawn_local({
+                                let processes = processes.clone();
+                                let commands_sender = commands_sender.clone();
+                                let runner_tx = message_sender.clone();
+                                async move {
+                                    match start_handler(
+                                        proc,
+                                        AddrErased { id, runner_tx: runner_tx.clone() },
+                                        commands_sender
+                                    ).await {
+                                        Ok(proc) => {
+                                            processes.write().await.insert(id, (ty, proc, end_handler));
+                                            let _ = addr.send(Ok(AddrErased { id, runner_tx }));
+                                        }
+                                        Err(e) => {
+                                            let _ = addr.send(Err(e.unwrap()));
+                                        }
+                                    }
+                                }
+                            }));
                         }
                         RuntimeCommand::GetAddrOf { ty, addr } => {
                             let _ = addr.send(
                                 only_one(processes.read().await.iter()
-                                    .filter(|(_id, (ty_, _))| *ty_ == ty))
+                                    .filter(|(_id, (ty_, _, _))| *ty_ == ty))
                                     .map(|(id, _)| AddrErased { id: *id, runner_tx: message_sender.clone() }).map_err(|e| if e.is_some() { SingletonError::MoreThanOne } else { SingletonError::NotPresent})
                             );
                         }
@@ -421,6 +575,22 @@ impl Runtime {
                 }
                 else => break
             }
+        }
+
+        // shut the runtime down
+        tasks.iter().for_each(JoinHandle::abort);
+        let processes = Arc::into_inner(processes).unwrap().into_inner();
+        for (id, (_ty, proc, ender)) in processes {
+            let _ = tokio::task::spawn_local(ender(
+                proc,
+                AddrErased {
+                    runner_tx: message_sender.clone(),
+                    id,
+                },
+                None,
+                commands_sender.clone(),
+            ))
+            .await;
         }
     }
 }
@@ -448,7 +618,7 @@ pub fn only_one<I: Iterator>(mut iter: I) -> Result<I::Item, Option<I::Item>> {
 
 /// `use acril_rt::prelude::*;` to import the commonly used types.
 pub mod prelude {
+    pub use crate::{Addr, Arbiter, Context, Runtime};
     #[doc(no_inline)]
     pub use acril::{self, Handler, Service};
-    pub use crate::{Addr, Arbiter, Context, Runtime};
 }

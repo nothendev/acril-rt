@@ -5,7 +5,7 @@ version = 3
 [[package]]
 name = "acril"
 version = "0.1.0"
-source = "git+https://github.com/PassivityTrading/acril#9c8f06520aa26accf4a6bff113aa3d2a74395fe7"
+source = "git+https://github.com/PassivityTrading/acril#5a98406de32b9b0dc2d700363e59eaa2ccd4bdf7"
 dependencies = [
  "futures",
  "pin-project",
